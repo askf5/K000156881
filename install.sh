@@ -1,14 +1,6 @@
 #!/bin/bash
 
-# v1.0 - works on an appliance
-# v1.1 - expects files to be copied to /shared/images, not /var/tmp (so that
-#        they're synced between blades in a VIPRION or bladed guest or bladed
-#        tenant)
-# v1.25 - updated to accept RPM, CID and TAGS environment or arguments
-# v1.26 - add begin/end markers to snippet added to /config/startup (to
-#         facilitate uninstall)
-# v1.27 - add proxy and CS cloud environment variables or arguments.
-# v1.28 - remove unnecessary flags from rpm, and move 'already installed' check lower
+# v1.0 - 2025-10-15 EAP release
 
 if test "$BASH" = "" || "$BASH" -uc "a=();true \"\${a[@]}\"" 2>/dev/null; then
     # Bash 4.4, Zsh
@@ -169,14 +161,12 @@ if ! [ -e /opt/CrowdStrike ]; then
 fi
 
 if ! [ -f /etc/systemd/system/falcon-sensor.service ]; then
-    # TODO: Restore selinux context? (doesn't currently seem necessary)
     cp /shared/CrowdStrike/f5-falcon-sensor.service /etc/systemd/system/falcon-sensor.service
     systemctl enable falcon-sensor.service
     systemctl start falcon-sensor.service
 fi
 
 if ! [ -f /etc/logrotate.d/falcon-sensor ]; then
-    # TODO: restore selinux context? (doesn't currently seem necessary)
     cp /shared/CrowdStrike/f5-logrotate-dropin /etc/logrotate.d/falcon-sensor
 fi
 ## END CrowdStrike falcon sensor
