@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# v1.0 - initial release
+# v1.2 - Added provisioning token support. Minor error-handling improvements.
+#        (Version numbers synced with install.sh. There is no v1.1.)
+
 if test "$BASH" = "" || "$BASH" -uc "a=();true \"\${a[@]}\"" 2>/dev/null; then
     # Bash 4.4, Zsh
     set -euo pipefail
@@ -21,6 +25,7 @@ CS_CID="${CS_CID:-}"
 CS_CLOUD="${CS_CLOUD:-}"
 CS_PROXY_HOST="${CS_PROXY_HOST:-}"
 CS_PROXY_PORT="${CS_PROXY_PORT:-}"
+CS_PROVISIONING_TOKEN="${CS_PROVISIONING_TOKEN:-}"
 SENSOR_RPM="${SENSOR_RPM:-}"
 TAGS="${TAGS:-}"
 
@@ -28,7 +33,7 @@ DEFAULT_SENSOR_RPM="/var/shared/falcon-sensor.rpm"
 
 usage() {
     {
-        echo "Usage: $0 [CS_CID] [-r|--rpm SENSOR_RPM] [-t|--tag TAGS] [-t|--tag ...] [-c|--cloud CLOUD] [--aph APH] [--app APP]"
+        echo "Usage: $0 [CS_CID] [-r|--rpm SENSOR_RPM] [-t|--tag TAGS] [-t|--tag ...] [-c|--cloud CLOUD] [--aph APH] [--app APP] [--provisioning-token TOKEN]"
         echo
         echo "Arguments/Options:"
         echo "  CS_CID       CrowdStrike Customer ID (or use CS_CID environment variable)"
@@ -44,6 +49,8 @@ usage() {
         echo "               Default: empty (directly connect to CrowdStrike cloud)"
         echo "      --app    Specify HTTP proxy port (or CS_PROXY_PORT environment variable)"
         echo "               Default: empty (directly connect to CrowdStrike cloud)"
+        echo "      --provisioning-token Specify installation token (or CS_PROVISIONING_TOKEN environment variable)."
+        echo "               Default: empty (specify when required)."
         echo "  -h, --help   Show this help message"
         echo
         echo "If no arguments are passed, environment variables are used."
@@ -60,10 +67,12 @@ fi
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -r|--rpm)
+            [[ $# -ge 2 ]] || { echo >&2 "Error: $1 requires a value"; usage; }
             SENSOR_RPM="$2"
             shift 2
             ;;
         -t|--tag|--tags)
+            [[ $# -ge 2 ]] || { echo >&2 "Error: $1 requires a value"; usage; }
             if [ -n "$TAGS" ]; then
                 TAGS="$TAGS,$2"
             else
@@ -72,22 +81,30 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -c|--cloud)
+            [[ $# -ge 2 ]] || { echo >&2 "Error: $1 requires a value"; usage; }
             CS_CLOUD="$2"
             shift 2
             ;;
         --aph)
+            [[ $# -ge 2 ]] || { echo >&2 "Error: $1 requires a value"; usage; }
             CS_PROXY_HOST="$2"
             shift 2
             ;;
         --app)
+            [[ $# -ge 2 ]] || { echo >&2 "Error: $1 requires a value"; usage; }
             CS_PROXY_PORT="$2"
+            shift 2
+            ;;
+        --provisioning-token)
+            [[ $# -ge 2 ]] || { echo >&2 "Error: $1 requires a value"; usage; }
+            CS_PROVISIONING_TOKEN="$2"
             shift 2
             ;;
         -h|--help)
             usage
             ;;
         *)
-            echo "Unknown option: $1" 2>&2
+            echo "Unknown option: $1" >&2
             usage
             ;;
     esac
@@ -109,6 +126,7 @@ readonly CS_CID
 readonly CS_CLOUD
 readonly CS_PROXY_HOST
 readonly CS_PROXY_PORT
+readonly CS_PROVISIONING_TOKEN
 readonly TAGS
 
 if [[ -z "$CS_CID" ]]; then
@@ -123,7 +141,11 @@ fi
 
 echo "Installing the sensor..."
 mount -o remount,rw /usr
-rpm --nodeps -Uvh "$SENSOR_RPM"
+if ! rpm --nodeps -Uvh "$SENSOR_RPM"; then
+    mount -o remount,ro /usr || true
+    echo >&2 "Error: RPM installation failed."
+    exit 1
+fi
 mount -o remount,ro /usr || true
 
 echo "Registering the sensor with given CID and tags..."
@@ -140,9 +162,12 @@ fi
 if [[ -n "$CS_PROXY_PORT" ]]; then
     /opt/CrowdStrike/falconctl -s --app="$CS_PROXY_PORT"
 fi
+if [[ -n "$CS_PROVISIONING_TOKEN" ]]; then
+    /opt/CrowdStrike/falconctl -s --provisioning-token="$CS_PROVISIONING_TOKEN"
+fi
 
 if ! [ -f /etc/systemd/system/falcon-sensor.service ]; then
-    cp /usr/lib/systemd/system/falcon-sensor.service /etc/systemd/system/falcon-sensor.service 
+    cp /usr/lib/systemd/system/falcon-sensor.service /etc/systemd/system/falcon-sensor.service
     systemctl enable falcon-sensor.service || true
     systemctl start falcon-sensor.service
 fi

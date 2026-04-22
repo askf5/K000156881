@@ -2,11 +2,13 @@
 
 # v1.0 - 2026-02-11 CrowdStrike GA release
 # v1.1 - Added root filesystem free space check before installation
+# v1.2 - Added provisioning token support, rearrange install steps and drop
+#        the root filesystem check. Minor error-handling improvements.
 
-if test "$BASH" = "" || "$BASH" -uc "a=();true \"\${a[@]}\"" 2>/dev/null; then     
-    # Bash 4.4, Zsh     
-    set -euo pipefail 
-else     
+if test "$BASH" = "" || "$BASH" -uc "a=();true \"\${a[@]}\"" 2>/dev/null; then
+    # Bash 4.4, Zsh
+    set -euo pipefail
+else
     # Bash 4.3 and older chokes on empty arrays with set -u.
     set -eo pipefail
 fi
@@ -24,49 +26,34 @@ CS_CID="${CS_CID:-}"
 CS_CLOUD="${CS_CLOUD:-}"
 CS_PROXY_HOST="${CS_PROXY_HOST:-}"
 CS_PROXY_PORT="${CS_PROXY_PORT:-}"
+CS_PROVISIONING_TOKEN="${CS_PROVISIONING_TOKEN:-}"
 SENSOR_RPM="${SENSOR_RPM:-}"
 TAGS="${TAGS:-}"
 
 DEFAULT_SENSOR_RPM="/shared/images/falcon-sensor.rpm"
-# v1.1 - Minimum free space required on "/" in MB (override via environment variable or --min-space)
-MIN_ROOT_SPACE_MB="${MIN_ROOT_SPACE_MB:-500}"
 
-# v1.1 - Check free space on "/" before installing
-check_root_free_space() {
-    local free_mb
-    free_mb=$(df -BM --output=avail / | tail -1 | tr -d '[:space:]M')
-
-    if [[ "$free_mb" -lt "$MIN_ROOT_SPACE_MB" ]]; then
-        echo >&2 "Error: Not enough free space on /. Available: ${free_mb}MB, Required: ${MIN_ROOT_SPACE_MB}MB."
-        exit 1
-    fi
-
-    echo "Free space check passed: ${free_mb}MB available on / (minimum: ${MIN_ROOT_SPACE_MB}MB)."
-}
-
-
-usage()  {
+usage() {
     {
-        echo "Usage: $0 [CS_CID] [-r|--rpm SENSOR_RPM] [-t|--tag TAGS] [-t|--tag ...] [-c|--cloud CLOUD] [--aph APH] [--app APP] [--min-space MB]"
+        echo "Usage: $0 [CS_CID] [-r|--rpm SENSOR_RPM] [-t|--tag TAGS] [-t|--tag ...] [-c|--cloud CLOUD] [--aph APH] [--app APP] [--provisioning-token TOKEN]"
         echo
         echo "Arguments/Options:"
         echo "  CS_CID       CrowdStrike Customer ID (or use CS_CID environment variable)"
         echo "  -r, --rpm    Falcon Sensor RPM path (or SENSOR_RPM environment variable)"
-        echo "                     Default: $DEFAULT_SENSOR_RPM"
+        echo "                    Default: $DEFAULT_SENSOR_RPM"
         echo "  -t, --tag    Comma-separated sensor group tags (or TAGS environment variable)"
         echo "                    If used multiple times, a comma will be added between each"
         echo "                    Default: empty (leave the sensor untagged/ungrouped)"
         echo "  -c, --cloud  Specify particular CrowdStrike cloud (or CS_CLOUD environment variable)."
-        echo "                      One of us-1, us-2, eu-1, us-gov-1, us-gov-2"
-        echo "                      Default: empty (sensor will automatically discover the correct value)."
-        echo "        --aph   Specify HTTP proxy host (or CS_PROXY_HOST environment variable)."
-        echo "                     Default: empty (directly connect to CrowdStrike cloud)."
-        echo "        --app   Specify HTTP proxy port (or CS_PROXY_PORT environment variable)."
-        echo "                     Default: empty (directly connect to CrowdStrike cloud)."
-		echo " --min-space Minimum free space required on / in MB (or MIN_ROOT_SPACE_MB environment variable)"
-		echo " Default: 500"
+        echo "                    One of us-1, us-2, eu-1, us-gov-1, us-gov-2"
+        echo "                    Default: empty (sensor will automatically discover the correct value)."
+        echo "      --aph   Specify HTTP proxy host (or CS_PROXY_HOST environment variable)."
+        echo "                    Default: empty (directly connect to CrowdStrike cloud)."
+        echo "      --app   Specify HTTP proxy port (or CS_PROXY_PORT environment variable)."
+        echo "                    Default: empty (directly connect to CrowdStrike cloud)."
+        echo "      --provisioning-token Specify installation token (or CS_PROVISIONING_TOKEN environment variable)."
+        echo "                    Default: empty (specify when required)."
         echo "  -h, --help   Show this help message"
-        echo         
+        echo
         echo "If no arguments are passed, environment variables are used."
     } >&2
     exit 1
@@ -81,10 +68,12 @@ fi
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -r|--rpm)
+            [[ $# -ge 2 ]] || { echo >&2 "Error: $1 requires a value"; usage; }
             SENSOR_RPM="$2"
             shift 2
             ;;
         -t|--tag|--tags)
+            [[ $# -ge 2 ]] || { echo >&2 "Error: $1 requires a value"; usage; }
             if [ -n "$TAGS" ]; then
                 TAGS="$TAGS,$2"
             else
@@ -93,26 +82,35 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -c|--cloud)
+            [[ $# -ge 2 ]] || { echo >&2 "Error: $1 requires a value"; usage; }
             CS_CLOUD="$2"
             shift 2
             ;;
         --aph)
+            [[ $# -ge 2 ]] || { echo >&2 "Error: $1 requires a value"; usage; }
             CS_PROXY_HOST="$2"
             shift 2
             ;;
         --app)
+            [[ $# -ge 2 ]] || { echo >&2 "Error: $1 requires a value"; usage; }
             CS_PROXY_PORT="$2"
             shift 2
             ;;
         --min-space)
-            MIN_ROOT_SPACE_MB="$2"
+            # silently ignore for backward-compatibility
+            [[ $# -ge 2 ]] || { echo >&2 "Error: $1 requires a value"; usage; }
+            shift 2
+            ;;
+        --provisioning-token)
+            [[ $# -ge 2 ]] || { echo >&2 "Error: $1 requires a value"; usage; }
+            CS_PROVISIONING_TOKEN="$2"
             shift 2
             ;;
         -h|--help)
             usage
             ;;
         *)
-            echo "Unknown option: $1" 2>&2
+            echo "Unknown option: $1" >&2
             usage
             ;;
     esac
@@ -123,7 +121,10 @@ if [[ -f /opt/CrowdStrike/falconctl ]]; then
     echo >&2 "Error: CrowdStrike sensor is already installed."
     exit 1
 fi
-
+if [[ -d /opt/CrowdStrike && ! -L /opt/CrowdStrike ]]; then
+    echo >&2 "Error: /opt/CrowdStrike already exists. Remove before proceeding."
+    exit 1
+fi
 
 # Default sensor RPM if not given
 if [[ -z "$SENSOR_RPM" ]]; then
@@ -135,8 +136,8 @@ readonly CS_CID
 readonly CS_CLOUD
 readonly CS_PROXY_HOST
 readonly CS_PROXY_PORT
+readonly CS_PROVISIONING_TOKEN
 readonly TAGS
-readonly MIN_ROOT_SPACE_MB
 
 if [[ -z "$CS_CID" ]]; then
     echo >&2 "Error: CS_CID must be provided (positional argument or environment variable)."
@@ -148,17 +149,18 @@ if ! [[ -f "$SENSOR_RPM" ]]; then
     exit 1
 fi
 
-# v1.1 - Verify sufficient free space on "/" before proceeding
-check_root_free_space
-
 echo "Installing the sensor..."
-mount -o remount,rw /usr
-rpm --nodeps -Uvh "$SENSOR_RPM"
-mount -o remount,ro /usr || true
-
-echo "Rearranging files into /shared/CrowdStrike..."
-mv /opt/CrowdStrike /shared/CrowdStrike
+if [ ! -d /shared/CrowdStrike ]; then
+    mkdir --mode=0750 /shared/CrowdStrike
+fi
 ln -sfT /shared/CrowdStrike /opt/CrowdStrike
+mount -o remount,rw /usr
+if ! rpm --nodeps --nopre -Uvh "$SENSOR_RPM"; then
+    mount -o remount,ro /usr || true
+    echo >&2 "Error: RPM installation failed."
+    exit 1
+fi
+mount -o remount,ro /usr || true
 
 cp /usr/lib/systemd/system/falcon-sensor.service /shared/CrowdStrike/f5-falcon-sensor.service
 cp /etc/logrotate.d/falcon-sensor /shared/CrowdStrike/f5-logrotate-dropin
@@ -177,6 +179,9 @@ if [[ -n "$CS_PROXY_HOST" ]]; then
 fi
 if [[ -n "$CS_PROXY_PORT" ]]; then
     /opt/CrowdStrike/falconctl -s --app="$CS_PROXY_PORT"
+fi
+if [[ -n "$CS_PROVISIONING_TOKEN" ]]; then
+    /opt/CrowdStrike/falconctl -s --provisioning-token="$CS_PROVISIONING_TOKEN"
 fi
 
 echo "Adding configuration snippet to /config/startup..."
