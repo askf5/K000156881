@@ -4,6 +4,7 @@
 # v1.1 - Added root filesystem free space check before installation
 # v1.2 - Added provisioning token support, rearrange install steps and drop
 #        the root filesystem check. Minor error-handling improvements.
+# v1.3 - Add `systemctl daemon-reload` into /config/startup.
 
 if test "$BASH" = "" || "$BASH" -uc "a=();true \"\${a[@]}\"" 2>/dev/null; then
     # Bash 4.4, Zsh
@@ -195,6 +196,7 @@ fi
 
 if ! [ -f /etc/systemd/system/falcon-sensor.service ]; then
     cp /shared/CrowdStrike/f5-falcon-sensor.service /etc/systemd/system/falcon-sensor.service
+    systemctl daemon-reload
     systemctl enable falcon-sensor.service
     systemctl start falcon-sensor.service
 fi

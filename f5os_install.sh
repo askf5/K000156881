@@ -3,6 +3,7 @@
 # v1.0 - initial release
 # v1.2 - Added provisioning token support. Minor error-handling improvements.
 #        (Version numbers synced with install.sh. There is no v1.1.)
+# v1.3 - Add `systemctl daemon-reload` after touching .service unit
 
 if test "$BASH" = "" || "$BASH" -uc "a=();true \"\${a[@]}\"" 2>/dev/null; then
     # Bash 4.4, Zsh
@@ -168,6 +169,7 @@ fi
 
 if ! [ -f /etc/systemd/system/falcon-sensor.service ]; then
     cp /usr/lib/systemd/system/falcon-sensor.service /etc/systemd/system/falcon-sensor.service
+    systemctl daemon-reload
     systemctl enable falcon-sensor.service || true
     systemctl start falcon-sensor.service
 fi
