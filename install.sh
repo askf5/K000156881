@@ -5,6 +5,8 @@
 # v1.2 - Added provisioning token support, rearrange install steps and drop
 #        the root filesystem check. Minor error-handling improvements.
 # v1.3 - Add `systemctl daemon-reload` into /config/startup.
+# v1.4 - Add --ignoresize to rpm and explicit free space preflight checks
+#        using free (not available) blocks, since we install as root.
 
 if test "$BASH" = "" || "$BASH" -uc "a=();true \"\${a[@]}\"" 2>/dev/null; then
     # Bash 4.4, Zsh
@@ -32,6 +34,42 @@ SENSOR_RPM="${SENSOR_RPM:-}"
 TAGS="${TAGS:-}"
 
 DEFAULT_SENSOR_RPM="/shared/images/falcon-sensor.rpm"
+
+# Minimum free space on /usr in MiB. Override via environment variable.
+# The sensor RPM only places a small systemd unit file (~4 KiB) in /usr.
+# 10 MiB is generous.  Set to 0 to disable the check.
+MIN_USR_FREE_MIB="${MIN_USR_FREE_MIB:-10}"
+# Minimum free space on /shared in MiB. Override via environment variable.
+# Set to 0 to disable the check.
+MIN_SHARED_FREE_MIB="${MIN_SHARED_FREE_MIB:-250}"
+
+# Check that a filesystem has a sufficient amount of free space.  Unlike rpm and
+# df's "Use%", uses free blocks (%f) rather than available blocks (%a) because
+# this script can use the filesystem's reserved blocks.
+check_free_space() {
+    local fs="$1"
+    local required_mib="$2"
+
+    # Validate required_mib is a non-negative integer; this value might come
+    # from env var containing anything.
+    if ! [[ "$required_mib" =~ ^[0-9]+$ ]]; then
+        echo >&2 "Error: invalid free space requirement for '$fs': '${required_mib}' (expected non-negative integer in MiB)."
+        return 1
+    fi
+    if [[ "$required_mib" -eq 0 ]]; then
+        return 0
+    fi
+
+    local bsize free_blocks
+    read -r bsize free_blocks < <(stat -f -c '%S %f' "$fs")
+
+    local free_mib=$(( (bsize * free_blocks) / (1024 * 1024) ))
+
+    if (( free_mib < required_mib )); then
+        echo >&2 "Error: ${fs} has ${free_mib} MiB free (including reserved blocks). Need at least ${required_mib} MiB."
+        return 1
+    fi
+}
 
 usage() {
     {
@@ -150,13 +188,18 @@ if ! [[ -f "$SENSOR_RPM" ]]; then
     exit 1
 fi
 
+# Preflight: verify filesystems have enough space, since we're passing
+# '--ignoresize' to rpm.
+check_free_space /usr "$MIN_USR_FREE_MIB"
+check_free_space /shared "$MIN_SHARED_FREE_MIB"
+
 echo "Installing the sensor..."
 if [ ! -d /shared/CrowdStrike ]; then
     mkdir --mode=0750 /shared/CrowdStrike
 fi
 ln -sfT /shared/CrowdStrike /opt/CrowdStrike
 mount -o remount,rw /usr
-if ! rpm --nodeps --nopre -Uvh "$SENSOR_RPM"; then
+if ! rpm --nodeps --nopre --ignoresize -Uvh "$SENSOR_RPM"; then
     mount -o remount,ro /usr || true
     echo >&2 "Error: RPM installation failed."
     exit 1
