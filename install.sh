@@ -1,12 +1,14 @@
 #!/bin/bash
 
-# v1.0 - 2026-02-11 CrowdStrike GA release
+# v1.0 - CrowdStrike GA release
 # v1.1 - Added root filesystem free space check before installation
 # v1.2 - Added provisioning token support, rearrange install steps and drop
 #        the root filesystem check. Minor error-handling improvements.
 # v1.3 - Add `systemctl daemon-reload` into /config/startup.
 # v1.4 - Add --ignoresize to rpm and explicit free space preflight checks
 #        using free (not available) blocks, since we install as root.
+# v2.0 - Convert /opt/CrowdStrike from a symlink to a bind mount of
+#        /shared/CrowdStrike. Migration of existing installs must use migrate.sh.
 
 if test "$BASH" = "" || "$BASH" -uc "a=();true \"\${a[@]}\"" 2>/dev/null; then
     # Bash 4.4, Zsh
@@ -34,6 +36,16 @@ SENSOR_RPM="${SENSOR_RPM:-}"
 TAGS="${TAGS:-}"
 
 DEFAULT_SENSOR_RPM="/shared/images/falcon-sensor.rpm"
+
+# Persistent install location shared across all boot locations. This is where
+# the sensor's files live.
+CS_STORE="/shared/CrowdStrike"
+# F5 helper persistent directory. Holds the systemd units, drop-in, service copy,
+# logrotate copy and archived RPM. Earlier versions of the install script copied
+# these into /shared/CrowdStrike.
+CS_STASH="/shared/CrowdStrike-f5"
+# Real mountpoint on the root filesystem. The bind mount is established onto this.
+CS_OPT="/opt/CrowdStrike"
 
 # Minimum free space on /usr in MiB. Override via environment variable.
 # The sensor RPM only places a small systemd unit file (~4 KiB) in /usr.
@@ -156,13 +168,22 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Fail early if falcon-sensor is already installed.
-if [[ -f /opt/CrowdStrike/falconctl ]]; then
+if [[ -f "$CS_OPT/falconctl" ]]; then
     echo >&2 "Error: CrowdStrike sensor is already installed."
     exit 1
 fi
-if [[ -d /opt/CrowdStrike && ! -L /opt/CrowdStrike ]]; then
-    echo >&2 "Error: /opt/CrowdStrike already exists. Remove before proceeding."
+# A symlink without falconctl in the directory is unexpected.
+if [[ -L "$CS_OPT" ]]; then
+    echo >&2 "Error: $CS_OPT is a symlink from a previous install, but is "
+    echo >&2 "       missing falconctl. Investigate manually."
     exit 1
+fi
+# A real, non-empty directory that is not our bind mount is unexpected; do not touch it.
+if [[ -d "$CS_OPT" && ! -L "$CS_OPT" ]] && ! mountpoint -q "$CS_OPT"; then
+    if [ -n "$(ls -A "$CS_OPT" 2>/dev/null)" ]; then
+        echo >&2 "Error: $CS_OPT already exists and is not empty. Remove before proceeding."
+        exit 1
+    fi
 fi
 
 # Default sensor RPM if not given
@@ -193,22 +214,88 @@ fi
 check_free_space /usr "$MIN_USR_FREE_MIB"
 check_free_space /shared "$MIN_SHARED_FREE_MIB"
 
-echo "Installing the sensor..."
-if [ ! -d /shared/CrowdStrike ]; then
-    mkdir --mode=0750 /shared/CrowdStrike
+if [ ! -d "$CS_STORE" ]; then
+    mkdir --mode=0750 "$CS_STORE"
 fi
-ln -sfT /shared/CrowdStrike /opt/CrowdStrike
+if [ ! -d "$CS_STASH" ]; then
+    mkdir --mode=0750 "$CS_STASH"
+fi
+if [ ! -d "$CS_OPT" ]; then
+    mkdir --mode=0750 "$CS_OPT"
+fi
+if ! mountpoint -q "$CS_OPT"; then
+    mount --bind "$CS_STORE" "$CS_OPT"
+fi
+
+echo "Installing the sensor..."
 mount -o remount,rw /usr
-if ! rpm --nodeps --nopre --ignoresize -Uvh "$SENSOR_RPM"; then
+if ! rpm --nodeps --ignoresize -Uvh "$SENSOR_RPM"; then
     mount -o remount,ro /usr || true
     echo >&2 "Error: RPM installation failed."
     exit 1
 fi
 mount -o remount,ro /usr || true
 
-cp /usr/lib/systemd/system/falcon-sensor.service /shared/CrowdStrike/f5-falcon-sensor.service
-cp /etc/logrotate.d/falcon-sensor /shared/CrowdStrike/f5-logrotate-dropin
-cp "$SENSOR_RPM" /shared/CrowdStrike/
+cp /usr/lib/systemd/system/falcon-sensor.service "$CS_STASH/f5-falcon-sensor.service"
+cp /etc/logrotate.d/falcon-sensor "$CS_STASH/f5-logrotate-dropin"
+cp "$SENSOR_RPM" "$CS_STASH/"
+
+echo "Installing systemd units for bind-mount ordering..."
+cat > "$CS_STASH/f5-crowdstrike-bindmount-prep.service" << 'UNIT'
+# Prepares the /opt/CrowdStrike mountpoint before opt-CrowdStrike.mount binds
+# /shared/CrowdStrike onto it.
+
+[Unit]
+Description=Prepare /opt/CrowdStrike bind mountpoint (convert legacy symlink)
+DefaultDependencies=no
+Before=opt-CrowdStrike.mount
+RequiresMountsFor=/shared
+ConditionPathExists=/shared/CrowdStrike
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'if [ -L /opt/CrowdStrike ]; then rm -f /opt/CrowdStrike; fi; if ! [ -d /opt/CrowdStrike ]; then mkdir -m 0750 /opt/CrowdStrike; fi'
+
+[Install]
+WantedBy=sysinit.target multi-user.target
+UNIT
+
+cat > "$CS_STASH/f5-opt-CrowdStrike.mount" << 'UNIT'
+# Bind-mounts the persistent sensor install (/shared/CrowdStrike) onto the
+# real mountpoint /opt/CrowdStrike.
+
+[Unit]
+Description=Bind mount CrowdStrike data store onto /opt/CrowdStrike
+DefaultDependencies=no
+RequiresMountsFor=/shared
+Requires=crowdstrike-bindmount-prep.service
+After=crowdstrike-bindmount-prep.service
+
+[Mount]
+What=/shared/CrowdStrike
+Where=/opt/CrowdStrike
+Type=none
+Options=bind
+
+[Install]
+WantedBy=sysinit.target multi-user.target
+UNIT
+
+cat > "$CS_STASH/f5-10-bindmount.conf" << 'UNIT'
+# Declare dependency on opt-CrowdStrike.mount
+[Unit]
+Requires=opt-CrowdStrike.mount
+After=opt-CrowdStrike.mount
+UNIT
+
+install -m 0644 "$CS_STASH/f5-crowdstrike-bindmount-prep.service" /etc/systemd/system/crowdstrike-bindmount-prep.service
+install -m 0644 "$CS_STASH/f5-opt-CrowdStrike.mount" /etc/systemd/system/opt-CrowdStrike.mount
+install -d -m 0755 /etc/systemd/system/falcon-sensor.service.d
+install -m 0644 "$CS_STASH/f5-10-bindmount.conf" /etc/systemd/system/falcon-sensor.service.d/10-bindmount.conf
+systemctl daemon-reload
+# Enable so they come up on the next normal reboot.
+systemctl enable crowdstrike-bindmount-prep.service opt-CrowdStrike.mount
 
 echo "Registering the sensor with given CID and tags..."
 if [[ -n "$TAGS" ]]; then
@@ -232,20 +319,56 @@ echo "Adding configuration snippet to /config/startup..."
 cat >> /config/startup << "EOF"
 
 ## BEGIN CrowdStrike falcon sensor
-# Re-register the CrowdStrike falcon sensor on first boot into a new boot location
-if ! [ -e /opt/CrowdStrike ]; then
-    ln -sfT /shared/CrowdStrike /opt/CrowdStrike
-fi
+if [ -d /shared/CrowdStrike ]; then
+    if ! [ -d /shared/CrowdStrike-f5 ]; then
+        logger -p local0.crit -t falcon-on-bigip "CrowdStrike: persistent install location present, but /shared/CrowdStrike-f5 is missing; cannot restore sensor in this boot location"
+    else
+        # Re-register the CrowdStrike falcon sensor on first boot into a new boot location.
+        if [ -L /opt/CrowdStrike ]; then
+            rm -f /opt/CrowdStrike
+        fi
+        if ! [ -d /opt/CrowdStrike ]; then
+            mkdir -m 0750 /opt/CrowdStrike
+        fi
+        if ! mountpoint -q /opt/CrowdStrike; then
+            mount --bind /shared/CrowdStrike /opt/CrowdStrike
+        fi
 
-if ! [ -f /etc/systemd/system/falcon-sensor.service ]; then
-    cp /shared/CrowdStrike/f5-falcon-sensor.service /etc/systemd/system/falcon-sensor.service
-    systemctl daemon-reload
-    systemctl enable falcon-sensor.service
-    systemctl start falcon-sensor.service
-fi
+        # Restore systemd units for subsequent normal reboots in this boot location.
+        units_changed=0
+        service_installed=0
+        if ! [ -f /etc/systemd/system/crowdstrike-bindmount-prep.service ]; then
+            cp /shared/CrowdStrike-f5/f5-crowdstrike-bindmount-prep.service /etc/systemd/system/crowdstrike-bindmount-prep.service
+            units_changed=1
+        fi
+        if ! [ -f /etc/systemd/system/opt-CrowdStrike.mount ]; then
+            cp /shared/CrowdStrike-f5/f5-opt-CrowdStrike.mount /etc/systemd/system/opt-CrowdStrike.mount
+            units_changed=1
+        fi
+        if ! [ -f /etc/systemd/system/falcon-sensor.service.d/10-bindmount.conf ]; then
+            mkdir -p /etc/systemd/system/falcon-sensor.service.d
+            cp /shared/CrowdStrike-f5/f5-10-bindmount.conf /etc/systemd/system/falcon-sensor.service.d/10-bindmount.conf
+            units_changed=1
+        fi
 
-if ! [ -f /etc/logrotate.d/falcon-sensor ]; then
-    cp /shared/CrowdStrike/f5-logrotate-dropin /etc/logrotate.d/falcon-sensor
+        if ! [ -f /etc/systemd/system/falcon-sensor.service ]; then
+            cp /shared/CrowdStrike-f5/f5-falcon-sensor.service /etc/systemd/system/falcon-sensor.service
+            units_changed=1
+            service_installed=1
+        fi
+        if [ "$units_changed" = 1 ]; then
+            systemctl daemon-reload
+            systemctl enable crowdstrike-bindmount-prep.service opt-CrowdStrike.mount
+        fi
+        if [ "$service_installed" = 1 ]; then
+            systemctl enable falcon-sensor.service
+            systemctl start falcon-sensor.service
+        fi
+
+        if ! [ -f /etc/logrotate.d/falcon-sensor ]; then
+            cp /shared/CrowdStrike-f5/f5-logrotate-dropin /etc/logrotate.d/falcon-sensor
+        fi
+    fi
 fi
 ## END CrowdStrike falcon sensor
 
