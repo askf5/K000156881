@@ -142,6 +142,9 @@ fi
 
 echo "Installing the sensor..."
 mount -o remount,rw /usr
+systemctl stop lkrg.service
+systemctl disable lkrg.service
+systemctl mask lkrg.service
 if ! rpm --nodeps -Uvh "$SENSOR_RPM"; then
     mount -o remount,ro /usr || true
     echo >&2 "Error: RPM installation failed."

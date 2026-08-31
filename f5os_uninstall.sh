@@ -59,4 +59,7 @@ EOF
 fi
 
 uninstall_sensor
+systemctl unmask lkrg.service
+systemctl enable lkrg.service
+systemctl start lkrg.service
 echo "All done."
